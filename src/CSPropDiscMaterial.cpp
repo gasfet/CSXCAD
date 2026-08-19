@@ -125,7 +125,10 @@ CSPropDiscMaterial::CSPropDiscMaterial(CSPropDiscMaterial* prop, bool copyPrim) 
 	m_DB_Background = prop->m_DB_Background;
 	m_Scale = prop->m_Scale;
 	if (prop->m_Transform)
+	{
 		m_Transform = CSTransform::New(prop->m_Transform);
+		if (m_Transform) m_Transform->SetOwner(this);
+	}
 	//Copy does not read the data!!
 }
 
@@ -273,7 +276,10 @@ void CSPropDiscMaterial::Init()
 	m_DB_Background = true;
 
 	for (int n=0;n<3;++n)
+	{
 		m_mesh[n]=NULL;
+		m_Size[n]=0;
+	}
 	m_Disc_Ind=NULL;
 	m_Disc_epsR=NULL;
 	m_Disc_kappa=NULL;
@@ -294,6 +300,7 @@ void CSPropDiscMaterial::SetTransform(CSTransform* transform)
 		return;
 	delete m_Transform;
 	m_Transform = transform;
+	if (m_Transform) m_Transform->SetOwner(this);
 }
 
 bool CSPropDiscMaterial::Write2XML(TiXmlNode& root, bool parameterised, bool sparse)
@@ -329,6 +336,7 @@ bool CSPropDiscMaterial::ReadFromXML(TiXmlNode &root)
 	TiXmlElement* dfElem = prop->FirstChildElement("DiscFile");
 	if (dfElem)
 	{
+		// Canonical format: File/Scale inside <DiscFile> child element (matches Write2XML).
 		m_FileType = 0;
 		dfElem->QueryIntAttribute("Type",&m_FileType);
 		if (dfElem->QueryStringAttribute("File",&m_Filename)!=TIXML_SUCCESS)
@@ -339,6 +347,22 @@ bool CSPropDiscMaterial::ReadFromXML(TiXmlNode &root)
 			SetUseDataBaseForBackground(help!=0);
 
 		if (dfElem->QueryDoubleAttribute("Scale",&m_Scale)!=TIXML_SUCCESS)
+			m_Scale=1;
+	}
+	else
+	{
+		// Legacy format: File/Scale as attributes on <DiscMaterial> element.
+		// Read for backward compatibility with older serializers.
+		m_FileType = 0;
+		prop->QueryIntAttribute("Type",&m_FileType);
+		if (prop->QueryStringAttribute("File",&m_Filename)!=TIXML_SUCCESS)
+			m_Filename.clear();
+
+		int help;
+		if (prop->QueryIntAttribute("UseDBBackground",&help)==TIXML_SUCCESS)
+			SetUseDataBaseForBackground(help!=0);
+
+		if (prop->QueryDoubleAttribute("Scale",&m_Scale)!=TIXML_SUCCESS)
 			m_Scale=1;
 	}
 
@@ -523,8 +547,20 @@ void CSPropDiscMaterial::ShowPropertyStatus(std::ostream& stream)
 	stream << "  Density\t: " << Density.GetValueString() << std::endl;
 }
 
-vtkPolyData* CSPropDiscMaterial::CreatePolyDataModel() const
+vtkPolyData* CSPropDiscMaterial::CreatePolyDataModel()
 {
+	// the voxel data is loaded lazily, make sure it is available before using it
+	EnsureFileLoaded();
+
+	// without valid data the unsigned loop bounds below would underflow (m_Size-1)
+	// and m_Disc_Ind/m_mesh would be dereferenced as NULL
+	if ((m_Disc_Ind==NULL) || (m_mesh[0]==NULL) || (m_mesh[1]==NULL) || (m_mesh[2]==NULL)
+		|| (m_Size[0]<2) || (m_Size[1]<2) || (m_Size[2]<2))
+	{
+		std::cerr << __func__ << ": Error, no valid discrete material data available, skipping model creation..." << std::endl;
+		return NULL;
+	}
+
 	vtkPolyData* polydata = vtkPolyData::New();
 	vtkCellArray *poly = vtkCellArray::New();
 	vtkPoints *points = vtkPoints::New();
@@ -541,49 +577,57 @@ vtkPolyData* CSPropDiscMaterial::CreatePolyDataModel() const
 	}
 
 	unsigned int mat_idx, mat_idx_down;
+	unsigned int mat_up_val, mat_down_val;
 	unsigned int mesh_idx=0;
 	bool bd, bu;
 	int nP, nPP;
 	unsigned int pos[3],rpos[3];
-	for (pos[2]=0;pos[2]<m_Size[2]-1;++pos[2])
+	// sweep over mesh nodes (not cells): a surface may also sit on the very last
+	// node of the data set, i.e. when the material reaches the boundary
+	for (pos[2]=0;pos[2]<m_Size[2];++pos[2])
 	{ // each xy-plane
 		for (unsigned int n=0;n<m_Size[0]*m_Size[1];++n)
 		{
 			pointIdx[0][n]=pointIdx[1][n];
 			pointIdx[1][n]=-1;
 		}
-		for (pos[0]=0;pos[0]<m_Size[0]-1;++pos[0])
-			for (pos[1]=0;pos[1]<m_Size[1]-1;++pos[1])
+		for (pos[0]=0;pos[0]<m_Size[0];++pos[0])
+			for (pos[1]=0;pos[1]<m_Size[1];++pos[1])
 			{
-				mat_idx = pos[0] + pos[1]*(m_Size[0]-1) + pos[2]*(m_Size[0]-1)*(m_Size[1]-1);
 				for (int n=0;n<3;++n)
 				{
+					// the quad spans one cell in both perpendicular directions
+					if ((pos[(n+1)%3]>=m_Size[(n+1)%3]-1) || (pos[(n+2)%3]>=m_Size[(n+2)%3]-1))
+						continue;
+
 					// reset relative pos
 					rpos[0]=pos[0];
 					rpos[1]=pos[1];
 					rpos[2]=pos[2];
 					bd = false;
 					bu = false;
-					if (pos[n]==0)
+
+					// material of the cells above/below the face at node pos[n];
+					// everything outside the data set is background
+					mat_up_val = 0;
+					mat_down_val = 0;
+					if (pos[n]<m_Size[n]-1)
 					{
-						if (m_Disc_Ind[mat_idx]>0)
-							bd=true;
+						mat_idx = pos[0] + pos[1]*(m_Size[0]-1) + pos[2]*(m_Size[0]-1)*(m_Size[1]-1);
+						mat_up_val = m_Disc_Ind[mat_idx];
 					}
-					else if (pos[n]==m_Size[n]-2)
-					{
-						if (m_Disc_Ind[mat_idx]>0)
-							bu=true;
-					}
-					else
+					if (pos[n]>0)
 					{
 						rpos[n] = pos[n]-1; // set relative pos
 						mat_idx_down  = rpos[0] + rpos[1]*(m_Size[0]-1) + rpos[2]*(m_Size[0]-1)*(m_Size[1]-1);
 						rpos[n] = pos[n]; // reset relative pos
-						if ((m_Disc_Ind[mat_idx]>0) && (m_Disc_Ind[mat_idx_down]==0))
-							bd=true;
-						else if (m_Disc_Ind[mat_idx]==0 && (m_Disc_Ind[mat_idx_down]>0))
-							bu=true;
+						mat_down_val = m_Disc_Ind[mat_idx_down];
 					}
+
+					if ((mat_up_val>0) && (mat_down_val==0))
+						bd=true;
+					else if ((mat_up_val==0) && (mat_down_val>0))
+						bu=true;
 
 					rpos[0]=pos[0];
 					rpos[1]=pos[1];
